@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -192,6 +194,11 @@ var (
 	initOnce sync.Once
 
 	errNotFound = errors.New("Intel RDT not available")
+
+	// These regexps match and parse lines in schemata that we know of (L3: and MB:).
+	// They also remove whitespace around the parsed keys and values.
+	mbLineMatch = regexp.MustCompile(`^MB:(?:\s*(\w+)\s*=\s*(\w+)\s*;)*(?:\s*(\w)+\s*=\s*(\w+)\s*)+;?\s*$`)
+	l3LineMatch = regexp.MustCompile(`^L3:(?:\s*(\w+)\s*=\s*([[:xdigit:]]+)\s*;)*(?:\s*(\w)+\s*=\s*([[:xdigit:]]+)\s*)+;?\s*$`)
 )
 
 // Check if Intel RDT sub-features are enabled in featuresInit()
@@ -622,6 +629,166 @@ func combineSchemas(l3CacheSchema, memBwSchema string) string {
 	return strings.Join(validLines, "\n") + "\n" + memBwSchema
 }
 
+func removeEmptyLines(lines []string) []string {
+	realLines := make([]string, 0)
+
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		realLines = append(realLines, line)
+	}
+
+	return realLines
+}
+
+type lineType int
+
+const (
+	l3line lineType = iota
+	mbline
+)
+
+type parsedLine struct {
+	prefix lineType
+	tokens map[string]string
+}
+
+func normalizeMask(mask string) string {
+	// The CBM might contain leading zeros (or not). To make the comparison
+	// possible we "normalize" the masks by removing leading zeros.
+	return strings.TrimLeft(mask, "0")
+}
+
+func parseLinesToTokenMaps(lines []string) ([]parsedLine, error) {
+	parsedLines := make([]parsedLine, 0)
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "MB:") {
+			tokenMap := make(map[string]string)
+			tokens := mbLineMatch.FindStringSubmatch(line)
+			if tokens == nil {
+				return nil, fmt.Errorf("Schemata line did not match regexp")
+			}
+
+			// There needs to be an even number of tokens. The regexp makes sure
+			// that's the case if we leave out the first token, which is the
+			// whole line match.
+			tokens = tokens[1:]
+			for i := range tokens {
+				if i%2 == 0 {
+					tokenMap[tokens[i]] = tokens[i+1]
+				}
+			}
+
+			parsedLines = append(parsedLines, parsedLine{
+				prefix: mbline,
+				tokens: tokenMap,
+			})
+		} else if strings.HasPrefix(line, "L3:") {
+			tokenMap := make(map[string]string)
+			tokens := l3LineMatch.FindStringSubmatch(line)
+			if tokens == nil {
+				return nil, fmt.Errorf("Schemata line did not match regexp")
+			}
+
+			tokens = tokens[1:]
+			for i := range tokens {
+				if i%2 == 0 {
+					tokenMap[tokens[i]] = normalizeMask(tokens[i+1])
+				}
+			}
+
+			parsedLines = append(parsedLines, parsedLine{
+				prefix: l3line,
+				tokens: tokenMap,
+			})
+
+		} else {
+			return nil, fmt.Errorf("Unknown line type")
+		}
+	}
+
+	return parsedLines, nil
+}
+
+func compareParsedLines(aLines, bLines []parsedLine) bool {
+	// Each line in aLines must match to at least one match in bLines
+	// (and vice versa, because aLines might have duplicates).
+
+	for _, a := range aLines {
+		found := false
+		for _, b := range bLines {
+			if reflect.DeepEqual(a.tokens, b.tokens) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// No match for a in bLines.
+			return false
+		}
+	}
+
+	for _, b := range bLines {
+		found := false
+		for _, a := range aLines {
+			if reflect.DeepEqual(b, a) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// No match for b in aLines.
+			return false
+		}
+	}
+
+	return true
+}
+
+func checkExistingSchemata(path, schemata string) error {
+	// Read the existing schemata to a string.
+	existingSchemata, err := os.ReadFile(filepath.Join(path, "schemata"))
+	if err != nil {
+		return err
+	}
+
+	return checkSchemataMatch(string(existingSchemata), schemata)
+}
+
+func checkSchemataMatch(existingSchemata, newSchemata string) error {
+
+	// Split both schemata to lines and  remove empty lines.
+	existingSchemataLines := removeEmptyLines(strings.Split(existingSchemata, "\n"))
+	newSchemataLines := removeEmptyLines(strings.Split(newSchemata, "\n"))
+
+	// First check: see if both schemata have the same number of items.
+	if len(newSchemataLines) != len(existingSchemataLines) {
+		return fmt.Errorf("Mismatching number of lines in schemata")
+	}
+
+	// Parse the lines to token maps.
+
+	existingSchemataParsedLines, err := parseLinesToTokenMaps(existingSchemataLines)
+	if err != nil {
+		return err
+	}
+
+	newSchemataParsedLines, err := parseLinesToTokenMaps(newSchemataLines)
+	if err != nil {
+		return err
+	}
+
+	// Compare the map lists with each other.
+	matches := compareParsedLines(newSchemataParsedLines, existingSchemataParsedLines)
+	if !matches {
+		return fmt.Errorf("Lines don't match")
+	}
+
+	return nil
+}
+
 // Set Intel RDT "resource control" filesystem as configured.
 func (m *Manager) Set(container *configs.Config) error {
 	// About L3 cache schema:
@@ -673,31 +840,34 @@ func (m *Manager) Set(container *configs.Config) error {
 		path := m.GetPath()
 		l3CacheSchema := container.IntelRdt.L3CacheSchema
 		memBwSchema := container.IntelRdt.MemBwSchema
-
-		// TODO: verify that l3CacheSchema and/or memBwSchema match the
-		// existing schemata if ClosID has been specified. This is a more
-		// involved than reading the file and doing plain string comparison as
-		// the value written in does not necessarily match what gets read out
-		// (leading zeros, cache id ordering etc).
+		schemata := ""
 
 		// Write a single joint schema string to schemata file
 		if l3CacheSchema != "" && memBwSchema != "" {
-			schemata := combineSchemas(l3CacheSchema, memBwSchema)
-			if err := writeFile(path, "schemata", schemata); err != nil {
-				return err
-			}
+			schemata = combineSchemas(l3CacheSchema, memBwSchema)
 		}
 
 		// Write only L3 cache schema string to schemata file
 		if l3CacheSchema != "" && memBwSchema == "" {
-			if err := writeFile(path, "schemata", l3CacheSchema); err != nil {
-				return err
-			}
+			schemata = l3CacheSchema
 		}
 
 		// Write only memory bandwidth schema string to schemata file
 		if l3CacheSchema == "" && memBwSchema != "" {
-			if err := writeFile(path, "schemata", memBwSchema); err != nil {
+			schemata = memBwSchema
+		}
+
+		if schemata != "" {
+			if m.config.IntelRdt != nil && m.config.IntelRdt.ClosID != "" {
+				// ClosId is set -- verify that the value matches and
+				// return.
+				if err := checkExistingSchemata(path, schemata); err != nil {
+					return err
+				}
+				return nil
+			}
+
+			if err := writeFile(path, "schemata", schemata); err != nil {
 				return err
 			}
 		}
